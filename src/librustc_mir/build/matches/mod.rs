@@ -142,18 +142,9 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
 
         // create binding start block for link them by false edges
         let candidate_count = arms.iter().map(|c| c.patterns.len()).sum::<usize>();
-        let pre_binding_blocks: Vec<_> = (0..=candidate_count)
+        let pre_binding_blocks: Vec<_> = (0..candidate_count)
             .map(|_| self.cfg.start_new_block())
             .collect();
-
-        // There's one more pre_binding block than there are candidates so that
-        // every candidate can have a `next_candidate_pre_binding_block`.
-        let outer_source_info = self.source_info(span);
-        self.cfg.terminate(
-            *pre_binding_blocks.last().unwrap(),
-            outer_source_info,
-            TerminatorKind::Unreachable,
-        );
 
         let mut match_has_guard = false;
 
@@ -170,9 +161,8 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                 let arm_candidates: Vec<_> = arm.patterns
                     .iter()
                     .zip(candidate_pre_binding_blocks.by_ref())
-                    .zip(next_candidate_pre_binding_blocks.by_ref())
                     .map(
-                        |((pattern, pre_binding_block), next_candidate_pre_binding_block)| {
+                        |(pattern, pre_binding_block)| {
                             Candidate {
                                 span: pattern.span,
                                 match_pairs: vec![
@@ -187,7 +177,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                                 },
                                 pre_binding_block: *pre_binding_block,
                                 next_candidate_pre_binding_block:
-                                    *next_candidate_pre_binding_block,
+                                    next_candidate_pre_binding_blocks.next().cloned(),
                             }
                         },
                     )
@@ -224,6 +214,8 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
             &mut fake_borrows,
         );
 
+        let outer_source_info = self.source_info(span);
+
         if !otherwise.is_empty() {
             // All matches are exhaustive. However, because some matches
             // only have exponentially-large exhaustive decision trees, we
@@ -250,10 +242,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
         };
 
         // Step 5. Create everything else: the guards and the arms.
-
-        let outer_source_info = self.source_info(span);
-        let arm_end_blocks: Vec<_> = arm_candidates.into_iter().map(|(arm, candidates)| {
-            let mut arm_block = self.cfg.start_new_block();
+        let arm_end_blocks: Vec<_> = arm_candidates.into_iter().map(|(arm, mut candidates)| {
 
             let body = self.hir.mirror(arm.body.clone());
             let scope = self.declare_bindings(
@@ -265,14 +254,29 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                 Some((Some(&scrutinee_place), scrutinee_span)),
             );
 
-            for candidate in candidates {
-                self.bind_and_guard_matched_candidate(
-                    candidate,
+            let mut arm_block;
+            if candidates.len() == 1 {
+                arm_block = self.bind_and_guard_matched_candidate(
+                    candidates.pop().unwrap(),
                     arm.guard.clone(),
-                    arm_block,
                     &fake_borrow_temps,
                     scrutinee_span,
                 );
+            } else {
+                arm_block = self.cfg.start_new_block();
+            for candidate in candidates {
+                    let binding_end = self.bind_and_guard_matched_candidate(
+                    candidate,
+                    arm.guard.clone(),
+                    &fake_borrow_temps,
+                    scrutinee_span,
+                );
+                    self.cfg.terminate(
+                        binding_end,
+                        source_info,
+                        TerminatorKind::Goto { target: arm_block },
+                    );
+            }
             }
 
             if let Some(source_scope) = scope {
@@ -431,7 +435,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
             // since we don't call `match_candidates`, next fields are unused
             otherwise_block: None,
             pre_binding_block: block,
-            next_candidate_pre_binding_block: block,
+            next_candidate_pre_binding_block: None,
         };
 
         // Simplify the candidate. Since the pattern is irrefutable, this should
@@ -701,7 +705,7 @@ pub struct Candidate<'pat, 'tcx: 'pat> {
 
     // ...and the blocks for add false edges between candidates
     pre_binding_block: BasicBlock,
-    next_candidate_pre_binding_block: BasicBlock,
+    next_candidate_pre_binding_block: Option<BasicBlock>,
 }
 
 #[derive(Clone, Debug)]
@@ -968,14 +972,12 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
             if let [first_candidate, second_candidate] = window {
                 let source_info = self.source_info(first_candidate.span);
                 if let Some(otherwise_block) = first_candidate.otherwise_block {
-                    self.cfg.terminate(
+                    self.false_edges(
                         otherwise_block,
+                        second_candidate.pre_binding_block,
+                        first_candidate.next_candidate_pre_binding_block,
                         source_info,
-                        TerminatorKind::FalseEdges {
-                            real_target: second_candidate.pre_binding_block,
-                            imaginary_target: first_candidate.next_candidate_pre_binding_block,
-                        }
-                    )
+                    );
                 } else {
                     bug!("candidate other than the last has no guard");
                 }
@@ -989,13 +991,11 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
             if let Some(otherwise) = candidate.otherwise_block {
                 let source_info = self.source_info(candidate.span);
                 let unreachable = self.cfg.start_new_block();
-                self.cfg.terminate(
+                self.false_edges(
                     otherwise,
+                    unreachable,
+                    candidate.next_candidate_pre_binding_block,
                     source_info,
-                    TerminatorKind::FalseEdges {
-                        real_target: unreachable,
-                        imaginary_targets: candidate.next_candidate_pre_binding_block,
-                    }
                 );
                 self.cfg.terminate(unreachable, source_info, TerminatorKind::Unreachable);
             }
@@ -1006,13 +1006,11 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
         if let Some(otherwise) = last_candidate.otherwise_block {
             let source_info = self.source_info(last_candidate.span);
             let block = self.cfg.start_new_block();
-            self.cfg.terminate(
+            self.false_edges(
                 otherwise,
+                block,
+                last_candidate.next_candidate_pre_binding_block,
                 source_info,
-                TerminatorKind::FalseEdges {
-                    real_target: block,
-                    imaginary_target: last_candidate.next_candidate_pre_binding_block,
-                }
             );
             Some(block)
         } else {
@@ -1323,26 +1321,36 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
         &mut self,
         candidate: Candidate<'pat, 'tcx>,
         guard: Option<Guard<'tcx>>,
-        arm_block: BasicBlock,
         fake_borrows: &Vec<(&Place<'tcx>, Local)>,
         scrutinee_span: Span,
-    ) {
+    ) -> BasicBlock {
         debug!("bind_and_guard_matched_candidate(candidate={:?})", candidate);
 
         debug_assert!(candidate.match_pairs.is_empty());
 
         let candidate_source_info = self.source_info(candidate.span);
 
-        let mut block = self.cfg.start_new_block();
-        self.cfg.terminate(
-            candidate.pre_binding_block,
+        let mut block = candidate.pre_binding_block;
+
+        // If we are adding our own statements, then we need a fresh block.
+        let create_fresh_block = candidate.next_candidate_pre_binding_block.is_some()
+            || !candidate.bindings.is_empty()
+            || !candidate.ascriptions.is_empty()
+            || guard.is_some();
+
+        if create_fresh_block {
+            let fresh_block = self.cfg.start_new_block();
+            self.false_edges(
+                block,
+                fresh_block,
+                candidate.next_candidate_pre_binding_block,
             candidate_source_info,
-            TerminatorKind::FalseEdges {
-                real_target: block,
-                imaginary_target: candidate.next_candidate_pre_binding_block,
-            },
         );
+            block = fresh_block;
         self.ascribe_types(block, &candidate.ascriptions);
+        } else {
+            return block;
+        }
 
         // rust-lang/rust#27282: The `autoref` business deserves some
         // explanation here.
@@ -1487,7 +1495,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
             // because that would be before we've checked the result
             // from the guard.
             //
-            // But binding them on `arm_block` is *too late*, because
+            // But binding them on the arm is *too late*, because
             // then all of the candidates for a single arm would be
             // bound in the same place, that would cause a case like:
             //
@@ -1540,22 +1548,14 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                 by_value_bindings,
             );
 
-            self.cfg.terminate(
-                post_guard_block,
-                source_info,
-                TerminatorKind::Goto { target: arm_block },
-            );
+            post_guard_block
         } else {
             assert!(candidate.otherwise_block.is_none());
             // (Here, it is not too early to bind the matched
             // candidate on `block`, because there is no guard result
             // that we have to inspect before we bind them.)
             self.bind_matched_candidate_for_arm_body(block, &candidate.bindings);
-            self.cfg.terminate(
-                block,
-                candidate_source_info,
-                TerminatorKind::Goto { target: arm_block },
-            );
+            block
         }
     }
 
