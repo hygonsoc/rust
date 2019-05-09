@@ -220,6 +220,9 @@ fn check_statement(
             check_rvalue(tcx, mir, rval, span)
         }
 
+        StatementKind::FakeRead(FakeReadCause::ForMatchedPlace, _) => {
+            Err((span, "`match` or `if let` in `const fn` is unstable".into()))
+        }
         StatementKind::FakeRead(_, place) => check_place(tcx, mir, place, span),
 
         // just an assignment
