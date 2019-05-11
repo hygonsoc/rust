@@ -1180,9 +1180,9 @@ pub enum TerminatorKind<'tcx> {
     FalseEdges {
         /// The target normal control flow will take
         real_target: BasicBlock,
-        /// The list of blocks control flow could conceptually take, but won't
+        /// A block control flow could conceptually take, but won't
         /// in practice
-        imaginary_targets: Vec<BasicBlock>,
+        imaginary_target: BasicBlock,
     },
     /// A terminator for blocks that only take one path in reality, but where we
     /// reserve the right to unwind in borrowck, even if it won't happen in practice.
@@ -1319,8 +1319,8 @@ impl<'tcx> TerminatorKind<'tcx> {
             SwitchInt { ref targets, .. } => None.into_iter().chain(&targets[..]),
             FalseEdges {
                 ref real_target,
-                ref imaginary_targets,
-            } => Some(real_target).into_iter().chain(&imaginary_targets[..]),
+                ref imaginary_target,
+            } => Some(real_target).into_iter().chain(slice::from_ref(imaginary_target)),
         }
     }
 
@@ -1406,10 +1406,10 @@ impl<'tcx> TerminatorKind<'tcx> {
             } => None.into_iter().chain(&mut targets[..]),
             FalseEdges {
                 ref mut real_target,
-                ref mut imaginary_targets,
+                ref mut imaginary_target,
             } => Some(real_target)
                 .into_iter()
-                .chain(&mut imaginary_targets[..]),
+                .chain(slice::from_mut(imaginary_target)),
         }
     }
 
@@ -1712,12 +1712,9 @@ impl<'tcx> TerminatorKind<'tcx> {
             Assert { cleanup: None, .. } => vec!["".into()],
             Assert { .. } => vec!["success".into(), "unwind".into()],
             FalseEdges {
-                ref imaginary_targets,
                 ..
             } => {
-                let mut l = vec!["real".into()];
-                l.resize(imaginary_targets.len() + 1, "imaginary".into());
-                l
+                vec!["real".into(), "imaginary".into()]
             }
             FalseUnwind {
                 unwind: Some(_), ..
@@ -3402,10 +3399,10 @@ impl<'tcx> TypeFoldable<'tcx> for Terminator<'tcx> {
             Unreachable => Unreachable,
             FalseEdges {
                 real_target,
-                ref imaginary_targets,
+                imaginary_target,
             } => FalseEdges {
                 real_target,
-                imaginary_targets: imaginary_targets.clone(),
+                imaginary_target,
             },
             FalseUnwind {
                 real_target,

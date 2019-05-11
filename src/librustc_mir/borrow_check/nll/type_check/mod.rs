@@ -1789,12 +1789,10 @@ impl<'a, 'gcx, 'tcx> TypeChecker<'a, 'gcx, 'tcx> {
             }
             TerminatorKind::FalseEdges {
                 real_target,
-                ref imaginary_targets,
+                imaginary_target,
             } => {
                 self.assert_iscleanup(mir, block_data, real_target, is_cleanup);
-                for target in imaginary_targets {
-                    self.assert_iscleanup(mir, block_data, *target, is_cleanup);
-                }
+                self.assert_iscleanup(mir, block_data, imaginary_target, is_cleanup);
             }
             TerminatorKind::FalseUnwind {
                 real_target,
